@@ -21,7 +21,7 @@ npm run dev
 
 Hosted on **GitHub Pages**. After the first deploy:
 
-1. On the phone, open the Pages URL in **Chrome** (e.g. `https://<you>.github.io/<repo>/`).
+1. On the phone, open the Pages URL in **Chrome** (e.g. `https://ihelpmaybe.github.io/HEX-watch/`).
 2. Menu → **Install app** / **Add to Home screen**.
 3. Launch from the icon — works like a standalone app. Watchlist stays in that browser profile.
 
