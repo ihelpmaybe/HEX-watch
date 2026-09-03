@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>eHEX / USD</title>
+    <style>
+      html,
+      body,
+      #tv {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        min-height: 520px;
+        background: #0b0f14;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="tv"></div>
+    <script src="https://s3.tradingview.com/tv.js"></script>
+    <script>
+      // Advanced chart with drawing tools (left toolbar). Needs ~453px+ height.
+      new TradingView.widget({
+        autosize: true,
+        symbol: 'HEXUSD',
+        interval: 'W',
+        timezone: 'Etc/UTC',
+        theme: 'dark',
+        style: '1',
+        locale: 'en',
+        toolbar_bg: '#0b0f14',
+        enable_publishing: false,
+        hide_top_toolbar: false,
+        hide_legend: false,
+        // CRITICAL: default is true — that strips the left drawing tools
+        hide_side_toolbar: false,
+        allow_symbol_change: false,
+        save_image: false,
+        withdateranges: true,
+        details: false,
+        hotlist: false,
+        calendar: false,
+        container_id: 'tv',
+        backgroundColor: '#0b0f14',
+        gridColor: 'rgba(255,255,255,0.06)',
+        overrides: {
+          'mainSeriesProperties.priceAxisProperties.log': true,
+          'mainSeriesProperties.priceAxisProperties.logDisabled': false,
+          'mainSeriesProperties.minTick': '10000,1,false',
+        },
+      })
+    </script>
+  </body>
+</html>

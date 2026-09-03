@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.handoff/
+bakeoff/
+.tools/
+github-upload/
+HEX-watch-upload.zip
+*.local
+.DS_Store
+.env
+.env.*
+!.env.example
+android/
+.idea/
+.vscode/
+coverage/
+*.log

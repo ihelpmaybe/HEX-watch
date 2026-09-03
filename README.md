@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/31812718/README.md)
 # HEX Watch
 
 Local **watch-only** tracker for HEX stakes on Ethereum and PulseChain.
