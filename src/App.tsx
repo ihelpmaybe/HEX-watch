@@ -45,6 +45,8 @@ import {
   sharesToTshares,
   type TshareSnap,
 } from './tshare'
+import { assetUrl } from './assetUrl'
+import { BrandLogo, EthChainIcon } from './BrandLogo'
 import { usePullToRefresh } from './usePullToRefresh'
 import './styles.css'
 
@@ -150,6 +152,15 @@ function parseMoney(value: string | undefined): number | null {
   if (!value || value === '—') return null
   const n = Number(value.replace(/[^0-9.-]/g, ''))
   return Number.isFinite(n) ? n : null
+}
+
+function shortSyncError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error)
+  if (/failed to fetch|http request failed|network/i.test(raw)) {
+    return 'RPC unreachable'
+  }
+  const first = raw.split(/[\n.]/)[0]?.trim() || 'sync failed'
+  return first.length > 72 ? `${first.slice(0, 69)}…` : first
 }
 
 function formatSignedUsd(n: number | null): string {
@@ -276,9 +287,9 @@ type SortKey = 'soonest' | 'size' | 'start' | 'end'
 
 function ChainIcon({ chain }: { chain: ChainKey }) {
   if (chain === 'ethereum') {
-    return <img className="chain-icon eth" src="/brand/eth.svg" alt="" />
+    return <EthChainIcon className="chain-icon eth" />
   }
-  return <img className="chain-icon pls" src="/brand/pls.png" alt="" />
+  return <img className="chain-icon pls" src={assetUrl('brand/pls.png')} alt="" />
 }
 
 function StakeCard({
@@ -1125,9 +1136,7 @@ export function App() {
             )
           } catch (error) {
             errors.push(
-              `${CHAINS[key].label} ${entry.address.slice(0, 6)}…: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
+              `${CHAINS[key].label} ${entry.address.slice(0, 6)}…: ${shortSyncError(error)}`,
             )
           }
         }
@@ -1297,7 +1306,7 @@ export function App() {
 
         <div className="brand-block">
           <button type="button" className="brand" onClick={() => go('overview')}>
-            <img className="brand-logo" src="/brand/HEXagon.svg" alt="" />
+            <BrandLogo className="brand-logo" />
             <span className="brand-title">HEX Watch</span>
           </button>
           <ThinkingEyebrow
@@ -1337,7 +1346,7 @@ export function App() {
         <aside id="app-drawer" className="drawer" role="dialog" aria-modal="true" aria-label="Menu">
           <div className="drawer-head">
             <p className="drawer-brand">
-              <img className="brand-logo" src="/brand/HEXagon.svg" alt="" />
+              <BrandLogo className="brand-logo" />
               <span className="brand-title">HEX Watch</span>
             </p>
             <button type="button" className="ghost drawer-close" onClick={() => setDrawerOpen(false)}>
@@ -1678,10 +1687,10 @@ export function App() {
                   onClick={() => setChain(id)}
                 >
                   {id === 'ethereum' ? (
-                    <img className="chain-icon eth" src="/brand/eth.svg" alt="" />
+                    <EthChainIcon className="chain-icon eth" />
                   ) : null}
                   {id === 'pulsechain' ? (
-                    <img className="chain-icon pls" src="/brand/pls.png" alt="" />
+                    <img className="chain-icon pls" src={assetUrl('brand/pls.png')} alt="" />
                   ) : null}
                   {label}
                 </button>
