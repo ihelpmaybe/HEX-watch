@@ -26,7 +26,8 @@ const DAY_MASK = (1n << DAY_BITS) - 1n
 
 /** Public RPCs often reject oversized eth_getLogs ranges. */
 const LOG_CHUNK = 4_000n
-const CACHE_PREFIX = 'hex-watch/stake-history/v1/'
+/** v2 = StakeEnd-only scans (no StakeStart walk). */
+const CACHE_PREFIX = 'hex-watch/stake-history/v2/'
 
 const pulsechain = {
   id: 369,
@@ -58,15 +59,6 @@ interface CacheFile {
   savedAt: string
   stakes: StakeRow[]
   partial?: boolean
-}
-
-interface DecodedStart {
-  stakeId: number
-  timestamp: number
-  stakedHearts: bigint
-  stakeShares: bigint
-  stakedDays: number
-  isAutoStake: boolean
 }
 
 interface DecodedEnd {
@@ -121,27 +113,6 @@ function saveHistoryCache(
 
 export function clearHistoryCache(chain: ChainKey, address: Address) {
   localStorage.removeItem(cacheKey(chain, address))
-}
-
-function decodeStakeStart(data0: bigint, stakeId: bigint): DecodedStart {
-  let d = data0
-  const timestamp = Number(d & TIMESTAMP_MASK)
-  d >>= TIMESTAMP_BITS
-  const stakedHearts = d & HEARTS_MASK
-  d >>= HEARTS_BITS
-  const stakeShares = d & HEARTS_MASK
-  d >>= HEARTS_BITS
-  const stakedDays = Number(d & DAY_MASK)
-  d >>= DAY_BITS
-  const isAutoStake = d === 1n
-  return {
-    stakeId: Number(stakeId),
-    timestamp,
-    stakedHearts,
-    stakeShares,
-    stakedDays,
-    isAutoStake,
-  }
 }
 
 function decodeStakeEnd(data0: bigint, data1: bigint, stakeId: bigint): DecodedEnd {
@@ -199,12 +170,12 @@ type HexStakeLog = {
 
 async function getLogsChunked(
   client: PublicClient,
-  eventName: 'StakeStart' | 'StakeEnd',
   stakerAddr: Address,
   fromBlock: bigint,
   toBlock: bigint,
   onChunk?: (from: bigint, to: bigint) => void,
 ): Promise<{ logs: HexStakeLog[]; partial: boolean; errors: string[] }> {
+  const eventName = 'StakeEnd' as const
   const logs: HexStakeLog[] = []
   const errors: string[] = []
   let partial = false
@@ -315,18 +286,13 @@ function blankEnrichment(note: string): Pick<
   }
 }
 
-function toStakeRow(
-  start: DecodedStart | undefined,
-  end: DecodedEnd,
-  hexUsd: number | null,
-): StakeRow {
-  const hearts = start?.stakedHearts ?? end.stakedHearts
-  const shares = start?.stakeShares ?? end.stakeShares
-  const stakedDays = start?.stakedDays ?? end.servedDays
-  const lockedDay = start
-    ? estimateHexDay(start.timestamp * 1000)
-    : Math.max(0, estimateHexDay(end.timestamp * 1000) - end.servedDays)
+function toStakeRow(end: DecodedEnd, hexUsd: number | null): StakeRow {
+  const hearts = end.stakedHearts
+  const shares = end.stakeShares
+  // StakeEnd carries servedDays, not original stakedDays — good enough for history cards.
+  const stakedDays = end.servedDays
   const unlockedDay = estimateHexDay(end.timestamp * 1000)
+  const lockedDay = Math.max(0, unlockedDay - stakedDays)
   const endDay = lockedDay + stakedDays
   const principal = Number(formatUnits(hearts, 8))
   const payoutNum = Number(formatUnits(end.payout, 8))
@@ -343,7 +309,7 @@ function toStakeRow(
     lockedDay,
     stakedDays,
     unlockedDay,
-    isAutoStake: start?.isAutoStake ?? false,
+    isAutoStake: false,
     status: 'ended',
     progressPct: 100,
     startDate: formatDayDate(lockedDay),
@@ -361,7 +327,7 @@ function toStakeRow(
   }
 }
 
-/** Scan StakeEnd (+ StakeStart) logs for one address on one chain. */
+/** Scan StakeEnd logs only for one address on one chain. */
 export async function loadEndedHistory(
   chain: ChainKey,
   address: Address,
@@ -389,19 +355,10 @@ export async function loadEndedHistory(
       fromBlock: from,
       toBlock: to,
       head,
-      label: `${label} blocks ${from.toString()}–${to.toString()}`,
+      label: `${label} StakeEnd ${from.toString()}–${to.toString()}`,
     })
 
-  const ends = await getLogsChunked(client, 'StakeEnd', address, fromBlock, head, report)
-  const starts = await getLogsChunked(client, 'StakeStart', address, fromBlock, head, report)
-
-  const startById = new Map<number, DecodedStart>()
-  for (const log of starts.logs) {
-    const args = log.args
-    if (args.data0 == null || args.stakeId == null) continue
-    const decoded = decodeStakeStart(args.data0, BigInt(args.stakeId))
-    startById.set(decoded.stakeId, decoded)
-  }
+  const ends = await getLogsChunked(client, address, fromBlock, head, report)
 
   const stakes: StakeRow[] = []
   const seen = new Set<number>()
@@ -411,16 +368,14 @@ export async function loadEndedHistory(
     const end = decodeStakeEnd(args.data0, args.data1, BigInt(args.stakeId))
     if (seen.has(end.stakeId)) continue
     seen.add(end.stakeId)
-    stakes.push(toStakeRow(startById.get(end.stakeId), end, hexUsd))
+    stakes.push(toStakeRow(end, hexUsd))
   }
 
   stakes.sort((a, b) => b.unlockedDay - a.unlockedDay || b.stakeId - a.stakeId)
 
-  const partial = ends.partial || starts.partial
-  const errors = [...ends.errors, ...starts.errors].slice(0, 4)
-  const savedAt = saveHistoryCache(chain, address, stakes, partial)
+  const savedAt = saveHistoryCache(chain, address, stakes, ends.partial)
 
-  return { stakes, partial, errors, savedAt }
+  return { stakes, partial: ends.partial, errors: ends.errors.slice(0, 4), savedAt }
 }
 
 /** Load history for many addresses across both chains (cache-first unless force). */
