@@ -1895,12 +1895,12 @@ export function App() {
               <div className="history-bar" role="status">
                 <p>
                   {historyLoading
-                    ? historyProgress ?? 'Scanning StakeEnd logs…'
+                    ? historyProgress ?? 'Fetching ended stakes…'
                     : historyReady
                       ? `${filteredStakes.length} ended stake${
                           filteredStakes.length === 1 ? '' : 's'
-                        } (from logs + live)`
-                      : 'Ended stakes come from on-chain logs (not live stakeLists).'}
+                        } (from explorer logs + live)`
+                      : 'Ended stakes load from explorer StakeEnd logs (not stakeLists).'}
                 </p>
                 <div className="history-bar-actions">
                   <button
@@ -1909,7 +1909,11 @@ export function App() {
                     disabled={historyLoading || watchlist.length === 0}
                     onClick={() => void loadStakeHistory(true)}
                   >
-                    {historyReady ? 'Refresh history' : 'Load history'}
+                    {historyLoading
+                      ? 'Loading…'
+                      : historyReady
+                        ? 'Refresh history'
+                        : 'Load history'}
                   </button>
                 </div>
               </div>
@@ -1924,9 +1928,9 @@ export function App() {
             {filteredStakes.length === 0 ? (
               <p className="empty-inline">
                 {historyLoading
-                  ? 'Scanning history…'
+                  ? 'Loading ended stakes…'
                   : filter === 'ended' && !historyReady
-                    ? 'Load history to scan StakeEnd logs for watched addresses.'
+                    ? 'Load history to fetch StakeEnd logs for watched addresses.'
                     : flatStakes.length === 0
                       ? `No stakes on ${chainMeta.label}.`
                       : 'No stakes match these filters.'}

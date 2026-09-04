@@ -1,18 +1,5 @@
-import {
-  createPublicClient,
-  formatUnits,
-  http,
-  type Address,
-  type PublicClient,
-} from 'viem'
-import { mainnet } from 'viem/chains'
-import {
-  CHAINS,
-  HEX_ADDRESS,
-  HEX_EVENT_ABI,
-  HEX_LOG_FROM_BLOCK,
-  type ChainKey,
-} from './hex'
+import { formatUnits, type Address } from 'viem'
+import { CHAINS, HEX_ADDRESS, type ChainKey } from './hex'
 import { estimateHexDay, formatDayDate } from './hexMath'
 import type { StakeRow } from './data'
 import { money } from './quotes'
@@ -24,28 +11,25 @@ const TIMESTAMP_MASK = (1n << TIMESTAMP_BITS) - 1n
 const HEARTS_MASK = (1n << HEARTS_BITS) - 1n
 const DAY_MASK = (1n << DAY_BITS) - 1n
 
-/** Start chunk; shrinks on RPC range errors (some free RPCs cap at ~50–2k). */
-const LOG_CHUNK_START: Record<ChainKey, bigint> = {
-  ethereum: 2_000n,
-  pulsechain: 4_000n,
-}
-const LOG_CHUNK_MIN = 50n
-/** v3 = StakeEnd-only, newest-first, no empty-fail cache. */
-const CACHE_PREFIX = 'hex-watch/stake-history/v3/'
+/** StakeEnd(uint256,uint256,address,uint40) */
+const STAKE_END_TOPIC0 =
+  '0x72d9c5a7ab13846e08d9c838f9e866a1bb4a66a2fd3ba3c9e7da3cf9e394dfd7' as const
 
-const pulsechain = {
-  id: 369,
-  name: 'PulseChain',
-  nativeCurrency: { name: 'Pulse', symbol: 'PLS', decimals: 18 },
-  rpcUrls: { default: { http: ['https://rpc.pulsechain.com'] } },
-} as const
+/** Indexed explorer APIs — one (or few) HTTP calls, not a full-chain RPC crawl. */
+const EXPLORER_LOG_APIS: Record<ChainKey, string[]> = {
+  ethereum: [
+    'https://eth.blockscout.com/api',
+    'https://api.routescan.io/v2/network/mainnet/evm/1/etherscan/api',
+  ],
+  pulsechain: ['https://api.scan.pulsechain.com/api'],
+}
+
+const CACHE_PREFIX = 'hex-watch/stake-history/v5/'
+const PAGE_SIZE = 1000
 
 export interface HistoryProgress {
   chain: ChainKey
   address: Address
-  fromBlock: bigint
-  toBlock: bigint
-  head: bigint
   label: string
   found?: number
 }
@@ -74,6 +58,13 @@ interface DecodedEnd {
   payout: bigint
   penalty: bigint
   servedDays: number
+}
+
+interface ExplorerLog {
+  data?: string
+  topics?: string[]
+  timeStamp?: string
+  blockNumber?: string
 }
 
 function cacheKey(chain: ChainKey, address: Address): string {
@@ -120,6 +111,16 @@ export function clearHistoryCache(chain: ChainKey, address: Address) {
   localStorage.removeItem(cacheKey(chain, address))
 }
 
+function topicAddress(address: Address): string {
+  return `0x${address.slice(2).toLowerCase().padStart(64, '0')}`
+}
+
+function parseBlockNumber(raw: string | undefined): number | null {
+  if (!raw) return null
+  const n = raw.startsWith('0x') ? Number.parseInt(raw, 16) : Number.parseInt(raw, 10)
+  return Number.isFinite(n) ? n : null
+}
+
 function decodeStakeEnd(data0: bigint, data1: bigint, stakeId: bigint): DecodedEnd {
   let d = data0
   const timestamp = Number(d & TIMESTAMP_MASK)
@@ -144,117 +145,6 @@ function decodeStakeEnd(data0: bigint, data1: bigint, stakeId: bigint): DecodedE
     penalty,
     servedDays,
   }
-}
-
-async function clientsFor(chain: ChainKey): Promise<PublicClient[]> {
-  const config = CHAINS[chain]
-  const viemChain = chain === 'ethereum' ? mainnet : pulsechain
-  const out: PublicClient[] = []
-  for (const url of config.rpcUrls) {
-    try {
-      const client = createPublicClient({
-        chain: viemChain,
-        transport: http(url, { timeout: 20_000, retryCount: 0 }),
-      })
-      const id = await client.getChainId()
-      if (id !== config.chainId) continue
-      out.push(client as PublicClient)
-    } catch {
-      /* next */
-    }
-  }
-  return out
-}
-
-type HexStakeLog = {
-  args: {
-    data0?: bigint
-    data1?: bigint
-    stakeId?: number | bigint
-  }
-}
-
-function isRangeError(error: unknown): boolean {
-  const msg = error instanceof Error ? error.message : String(error)
-  return /block|range|limited|exceed|10,?000|query returned more|response size/i.test(msg)
-}
-
-async function fetchStakeEndChunk(
-  clients: PublicClient[],
-  stakerAddr: Address,
-  fromBlock: bigint,
-  toBlock: bigint,
-): Promise<{ logs: HexStakeLog[]; error?: string }> {
-  let lastErr = ''
-  for (const client of clients) {
-    try {
-      const batch = (await client.getContractEvents({
-        address: HEX_ADDRESS,
-        abi: HEX_EVENT_ABI,
-        eventName: 'StakeEnd',
-        args: { stakerAddr },
-        fromBlock,
-        toBlock,
-        strict: true,
-      })) as HexStakeLog[]
-      return { logs: batch }
-    } catch (error) {
-      lastErr = error instanceof Error ? error.message.split('\n')[0] : String(error)
-      if (!isRangeError(error)) continue
-      // try next client with same range; caller may shrink
-    }
-  }
-  return { logs: [], error: lastErr || 'getLogs failed' }
-}
-
-/**
- * Newest → oldest StakeEnd scan so recent ends appear first.
- * Shrinks chunk size when RPCs reject the range.
- */
-async function getLogsNewestFirst(
-  clients: PublicClient[],
-  chain: ChainKey,
-  stakerAddr: Address,
-  fromBlock: bigint,
-  toBlock: bigint,
-  onChunk?: (from: bigint, to: bigint, found: number) => void,
-  onLogs?: (logs: HexStakeLog[]) => void,
-): Promise<{ logs: HexStakeLog[]; partial: boolean; errors: string[] }> {
-  const logs: HexStakeLog[] = []
-  const errors: string[] = []
-  let partial = false
-  let chunk = LOG_CHUNK_START[chain]
-  let cursor = toBlock
-
-  while (cursor >= fromBlock) {
-    let start = cursor - chunk + 1n
-    if (start < fromBlock) start = fromBlock
-    onChunk?.(start, cursor, logs.length)
-
-    let result = await fetchStakeEndChunk(clients, stakerAddr, start, cursor)
-    while (result.error && isRangeError(result.error) && chunk > LOG_CHUNK_MIN) {
-      chunk = chunk > 500n ? chunk / 2n : LOG_CHUNK_MIN
-      start = cursor - chunk + 1n
-      if (start < fromBlock) start = fromBlock
-      onChunk?.(start, cursor, logs.length)
-      result = await fetchStakeEndChunk(clients, stakerAddr, start, cursor)
-    }
-
-    if (result.error) {
-      partial = true
-      if (errors.length < 4) {
-        errors.push(`StakeEnd ${start}-${cursor}: ${result.error}`)
-      }
-    } else if (result.logs.length) {
-      logs.push(...result.logs)
-      onLogs?.(result.logs)
-    }
-
-    if (start === fromBlock) break
-    cursor = start - 1n
-  }
-
-  return { logs, partial, errors }
 }
 
 function fmtHex(hearts: bigint): string {
@@ -340,24 +230,126 @@ function toStakeRow(end: DecodedEnd, hexUsd: number | null): StakeRow {
     ifEndedHex: fmtHex(ifEndedHearts > 0n ? ifEndedHearts : 0n),
     hsi: null,
     historical: true,
-    ...blankEnrichment('Historical · from StakeEnd log'),
+    ...blankEnrichment('Historical · explorer StakeEnd'),
   }
 }
 
-function logsToRows(logs: HexStakeLog[], hexUsd: number | null, seen: Set<number>): StakeRow[] {
+function parseExplorerLog(log: ExplorerLog): DecodedEnd | null {
+  const topics = log.topics
+  const data = log.data
+  if (!topics || topics.length < 3 || !data || data.length < 130) return null
+  try {
+    const stakeId = BigInt(topics[2])
+    const hex = data.startsWith('0x') ? data.slice(2) : data
+    if (hex.length < 128) return null
+    const data0 = BigInt(`0x${hex.slice(0, 64)}`)
+    const data1 = BigInt(`0x${hex.slice(64, 128)}`)
+    return decodeStakeEnd(data0, data1, stakeId)
+  } catch {
+    return null
+  }
+}
+
+async function fetchExplorerPage(
+  apiBase: string,
+  staker: Address,
+  fromBlock: number,
+): Promise<{ logs: ExplorerLog[]; error?: string }> {
+  const params = new URLSearchParams({
+    module: 'logs',
+    action: 'getLogs',
+    fromBlock: String(fromBlock),
+    toBlock: 'latest',
+    address: HEX_ADDRESS,
+    topic0: STAKE_END_TOPIC0,
+    topic1: topicAddress(staker),
+    topic0_1_opr: 'and',
+  })
+  const url = `${apiBase}?${params.toString()}`
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(25_000) })
+    if (!res.ok) return { logs: [], error: `HTTP ${res.status}` }
+    const json = (await res.json()) as {
+      status?: string
+      message?: string
+      result?: ExplorerLog[] | string
+    }
+    if (json.status === '0') {
+      const msg = String(json.result ?? json.message ?? 'explorer error')
+      if (/no records|no logs|result not found/i.test(msg)) return { logs: [] }
+      return { logs: [], error: msg.slice(0, 120) }
+    }
+    if (!Array.isArray(json.result)) return { logs: [] }
+    return { logs: json.result }
+  } catch (error) {
+    return {
+      logs: [],
+      error: error instanceof Error ? error.message.split('\n')[0] : String(error),
+    }
+  }
+}
+
+/** Pull all StakeEnd logs for one staker via explorer index (paginated at 1000). */
+async function fetchStakeEndsFromExplorer(
+  chain: ChainKey,
+  staker: Address,
+  onProgress?: (found: number, page: number) => void,
+): Promise<{ logs: ExplorerLog[]; partial: boolean; errors: string[] }> {
+  const apis = EXPLORER_LOG_APIS[chain]
+  const errors: string[] = []
+  let lastError = ''
+
+  for (const apiBase of apis) {
+    const all: ExplorerLog[] = []
+    let fromBlock = 0
+    let page = 0
+    let partial = false
+    let ok = false
+
+    while (page < 20) {
+      page += 1
+      onProgress?.(all.length, page)
+      const { logs, error } = await fetchExplorerPage(apiBase, staker, fromBlock)
+      if (error) {
+        lastError = error
+        break
+      }
+      ok = true
+      if (!logs.length) break
+      all.push(...logs)
+      if (logs.length < PAGE_SIZE) break
+      // Advance past last block so we do not loop forever on the same page.
+      const lastBn = parseBlockNumber(logs[logs.length - 1]?.blockNumber)
+      if (lastBn == null || lastBn < fromBlock) {
+        partial = true
+        break
+      }
+      fromBlock = lastBn + 1
+    }
+
+    if (ok) {
+      return { logs: all, partial, errors }
+    }
+  }
+
+  if (lastError) errors.push(lastError)
+  return { logs: [], partial: true, errors }
+}
+
+function logsToRows(logs: ExplorerLog[], hexUsd: number | null): StakeRow[] {
+  const seen = new Set<number>()
   const stakes: StakeRow[] = []
   for (const log of logs) {
-    const args = log.args
-    if (args.data0 == null || args.data1 == null || args.stakeId == null) continue
-    const end = decodeStakeEnd(args.data0, args.data1, BigInt(args.stakeId))
-    if (seen.has(end.stakeId)) continue
+    const end = parseExplorerLog(log)
+    if (!end || seen.has(end.stakeId)) continue
     seen.add(end.stakeId)
     stakes.push(toStakeRow(end, hexUsd))
   }
+  stakes.sort((a, b) => b.unlockedDay - a.unlockedDay || b.stakeId - a.stakeId)
   return stakes
 }
 
-/** Scan StakeEnd logs only for one address on one chain (newest first). */
+/** Load ended stakes for one address via explorer index (seconds, not a chain crawl). */
 export async function loadEndedHistory(
   chain: ChainKey,
   address: Address,
@@ -365,63 +357,38 @@ export async function loadEndedHistory(
   onProgress?: (p: HistoryProgress) => void,
   onPartial?: (stakes: StakeRow[]) => void,
 ): Promise<HistoryLoadResult> {
-  const clients = await clientsFor(chain)
-  if (clients.length === 0) {
-    return {
-      stakes: [],
-      partial: true,
-      errors: [`No working RPC for ${CHAINS[chain].label}`],
-      savedAt: new Date().toISOString(),
-    }
-  }
-
-  const head = await clients[0].getBlockNumber()
-  const fromBlock = HEX_LOG_FROM_BLOCK[chain]
   const label = CHAINS[chain].label
-  const seen = new Set<number>()
-  const stakes: StakeRow[] = []
-
-  const ends = await getLogsNewestFirst(
-    clients,
+  onProgress?.({
     chain,
     address,
-    fromBlock,
-    head,
-    (from, to, found) =>
+    found: 0,
+    label: `${label} · fetching StakeEnd index…`,
+  })
+
+  const { logs, partial, errors } = await fetchStakeEndsFromExplorer(
+    chain,
+    address,
+    (found, page) =>
       onProgress?.({
         chain,
         address,
-        fromBlock: from,
-        toBlock: to,
-        head,
         found,
-        label: `${label} StakeEnd · ${found} found · blocks ${from.toString()}–${to.toString()}`,
+        label: `${label} · StakeEnd page ${page} · ${found} so far`,
       }),
-    (batch) => {
-      const rows = logsToRows(batch, hexUsd, seen)
-      if (!rows.length) return
-      stakes.push(...rows)
-      stakes.sort((a, b) => b.unlockedDay - a.unlockedDay || b.stakeId - a.stakeId)
-      onPartial?.(stakes.slice())
-    },
   )
 
-  // Dedup if onLogs path missed (errors-only path still has ends.logs)
-  if (stakes.length === 0 && ends.logs.length) {
-    stakes.push(...logsToRows(ends.logs, hexUsd, seen))
-    stakes.sort((a, b) => b.unlockedDay - a.unlockedDay || b.stakeId - a.stakeId)
-  }
+  const stakes = logsToRows(logs, hexUsd)
+  onPartial?.(stakes)
 
-  // Never cache a total miss caused by RPC failure — that blocks retries.
   let savedAt = new Date().toISOString()
-  if (!(ends.partial && stakes.length === 0)) {
-    savedAt = saveHistoryCache(chain, address, stakes, ends.partial)
+  if (!(partial && stakes.length === 0 && errors.length > 0)) {
+    savedAt = saveHistoryCache(chain, address, stakes, partial)
   }
 
-  return { stakes, partial: ends.partial, errors: ends.errors.slice(0, 4), savedAt }
+  return { stakes, partial, errors: errors.slice(0, 4), savedAt }
 }
 
-/** Load history for many addresses across both chains (cache-first unless force). */
+/** Load history for many addresses (cache-first unless force). */
 export async function loadEndedHistoryForWatchlist(
   addresses: Address[],
   hexUsdByChain: Record<ChainKey, number | null>,
@@ -464,7 +431,9 @@ export async function loadEndedHistoryForWatchlist(
       )
       byKey[key] = result.stakes
       if (result.partial) partial = true
-      errors.push(...result.errors.map((e) => `${CHAINS[chain].label} ${address.slice(0, 6)}…: ${e}`))
+      errors.push(
+        ...result.errors.map((e) => `${CHAINS[chain].label} ${address.slice(0, 6)}…: ${e}`),
+      )
     }
   }
 
