@@ -80,6 +80,29 @@ export const HEX_READ_ABI = [
   },
 ] as const
 
+/** HEX stake lifecycle events (packed data0/data1 — see public HEX event layout). */
+export const HEX_EVENT_ABI = [
+  {
+    type: 'event',
+    name: 'StakeStart',
+    inputs: [
+      { name: 'data0', type: 'uint256', indexed: false },
+      { name: 'stakerAddr', type: 'address', indexed: true },
+      { name: 'stakeId', type: 'uint40', indexed: true },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'StakeEnd',
+    inputs: [
+      { name: 'data0', type: 'uint256', indexed: false },
+      { name: 'data1', type: 'uint256', indexed: false },
+      { name: 'stakerAddr', type: 'address', indexed: true },
+      { name: 'stakeId', type: 'uint40', indexed: true },
+    ],
+  },
+] as const
+
 export const HSIM_ADDRESS = '0x8BD3d1472A656e312E94fB1BbdD599B8C51D18e3' as const
 export const HDRN_ADDRESS = '0x3819f64f282bf135d62168C1e513280dAF905e06' as const
 
@@ -294,6 +317,12 @@ export const HSI_ABI = [
 
 export type ChainKey = 'ethereum' | 'pulsechain'
 
+/** Approximate deploy / useful scan starts for log chunking. */
+export const HEX_LOG_FROM_BLOCK: Record<ChainKey, bigint> = {
+  ethereum: 9_082_930n,
+  pulsechain: 0n,
+}
+
 export interface ChainConfig {
   key: ChainKey
   label: string
@@ -321,10 +350,10 @@ export const CHAINS: Record<ChainKey, ChainConfig> = {
     chainId: 369,
     explorerStake: (address) => `https://scan.pulsechain.com/address/${address}`,
     rpcUrls: [
-      'https://rpc.pulsechain.com',
       'https://pulsechain-rpc.publicnode.com',
       'https://pulsechain.publicnode.com',
       'https://rpc-pulsechain.g4mm4.io',
+      'https://rpc.pulsechain.com',
     ],
   },
 }
