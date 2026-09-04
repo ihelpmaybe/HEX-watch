@@ -94,6 +94,8 @@ export interface StakeRow {
   gasEthUsd: string
   gasPlsUsd: string
   gasPremium: string
+  /** True when reconstructed from StakeEnd/StakeStart logs (not live stakeLists). */
+  historical?: boolean
 }
 
 export interface AddressSnapshot {
@@ -756,7 +758,7 @@ async function enrichStakeRow(
         gasUsd: '—',
         gasNote: 'HSI · end through Hedron HSIM',
       }
-    : await estimateEndGas(client, gasOwner, raw.index, raw.stakeId, quotes, chain)
+    : await estimateEndGas(client, gasOwner, raw.index, raw.stakeId, quotes, chain, gasBoard)
 
   const shareState = await loadHdrnShareState(client, raw.stakeId, hsi)
   const mintDays = Math.max(0, Number(served) - shareState.mintedDays)
@@ -836,6 +838,7 @@ async function estimateEndGas(
   stakeId: number,
   quotes: QuoteSet,
   chain: ChainKey,
+  gasBoard: GasBoard | null,
 ): Promise<{ gasNative: string; gasUsd: string; gasNote: string }> {
   const data = encodeFunctionData({
     abi: HEX_READ_ABI,
@@ -852,7 +855,24 @@ async function estimateEndGas(
   } catch {
     /* typical stakeEnd weight */
   }
-  const gasPrice = await client.getGasPrice()
+
+  let gasPrice: bigint | null = null
+  try {
+    gasPrice = await client.getGasPrice()
+  } catch {
+    const gwei = chain === 'ethereum' ? gasBoard?.ethGwei : gasBoard?.plsGwei
+    if (gwei != null && Number.isFinite(gwei) && gwei > 0) {
+      gasPrice = BigInt(Math.round(gwei * 1e9))
+    }
+  }
+  if (gasPrice == null) {
+    return {
+      gasNative: '—',
+      gasUsd: '—',
+      gasNote: 'gas price unavailable · try refresh',
+    }
+  }
+
   const wei = gas * gasPrice
   const native = Number(formatEther(wei))
   if (chain === 'ethereum') {
