@@ -47,6 +47,11 @@ import {
 } from './tshare'
 import { assetUrl } from './assetUrl'
 import { BrandLogo, EthChainIcon } from './BrandLogo'
+import {
+  loadEndedHistoryForWatchlist,
+  loadHistoryCache,
+  type HistoryProgress,
+} from './stakeHistory'
 import { usePullToRefresh } from './usePullToRefresh'
 import './styles.css'
 
@@ -442,6 +447,7 @@ function StakeCard({
             >
               {s.status}
               {countdown ? <em>{countdown}</em> : null}
+              {s.historical ? <em> · log</em> : null}
             </span>
           </div>
         </div>
@@ -582,14 +588,14 @@ function StakeCard({
           <strong>{formatHex(s.ifEndedHex)}</strong>
           <span className="usd">Penalty {formatHex(s.penaltyHex)}</span>
         </div>
-        {hdrnWorthMinting(s, row.chain) ? (
+        {hdrnWorthMinting(s, row.chain) && !s.historical ? (
           <div className="ledger-line hdrn" role="row">
             <span className="metric">HDRN mint</span>
             <strong>{s.hdrnLoaned ? 'loaned' : formatHdrn(s.hdrnClaimable ?? '0')}</strong>
             <span className="usd">{hdrnMeta}</span>
           </div>
         ) : null}
-        {comWorthClaiming(s) ? (
+        {comWorthClaiming(s) && !s.historical ? (
           <div className="ledger-line com" role="row">
             <span className="metric">COM claim</span>
             <strong>{formatCom(s.comClaimable ?? '0')}</strong>
@@ -602,9 +608,9 @@ function StakeCard({
           </div>
         ) : null}
         <div className="ledger-line gas" role="row" title={s.gasNote}>
-          <span className="metric">Unstake gas</span>
-          <strong>{s.gasNative}</strong>
-          <span className="usd">{s.gasUsd}</span>
+          <span className="metric">{s.historical ? 'Source' : 'Unstake gas'}</span>
+          <strong>{s.historical ? 'StakeEnd' : s.gasNative}</strong>
+          <span className="usd">{s.historical ? s.gasNote : s.gasUsd}</span>
         </div>
       </div>
 
@@ -679,6 +685,12 @@ export function App() {
   })
   const [tshareBoard, setTshareBoard] = useState<Record<ChainKey, TshareSnap> | null>(null)
   const [costBasis, setCostBasis] = useState<CostBasisMap>(() => loadCostBasis())
+  const [historyByKey, setHistoryByKey] = useState<Record<string, StakeRow[]>>({})
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyProgress, setHistoryProgress] = useState<string | null>(null)
+  const [historyError, setHistoryError] = useState<string | null>(null)
+  const [historyReady, setHistoryReady] = useState(false)
+  const historyLoadingRef = useRef(false)
 
   const chainMeta =
     chain === 'all'
@@ -790,6 +802,33 @@ export function App() {
     }
   }, [])
 
+  // Prefill ended-history from local cache (no RPC).
+  useEffect(() => {
+    const next: Record<string, StakeRow[]> = {}
+    let any = false
+    for (const entry of watchlist) {
+      for (const key of BOTH_CHAINS) {
+        const cached = loadHistoryCache(key, entry.address)
+        if (cached) {
+          next[`${key}:${entry.address.toLowerCase()}`] = cached.stakes
+          any = true
+        }
+      }
+    }
+    if (any) {
+      setHistoryByKey(next)
+      setHistoryReady(true)
+    }
+  }, [watchlist])
+
+  // Lazy-load ended history when the Ended tab is opened.
+  useEffect(() => {
+    if (filter !== 'ended' || watchlist.length === 0) return
+    if (historyReady || historyLoadingRef.current) return
+    void loadStakeHistory(false)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, watchlist, chain])
+
   const scopedSnapshots = useMemo(
     () => (chain === 'all' ? snapshots : snapshots.filter((s) => s.chain === chain)),
     [snapshots, chain],
@@ -856,6 +895,33 @@ export function App() {
     })
   }, [scopedSnapshots, watchlist, hexDay])
 
+  const historicalFlat = useMemo(() => {
+    const rows: FlatStake[] = []
+    for (const [key, stakes] of Object.entries(historyByKey)) {
+      const colon = key.indexOf(':')
+      if (colon < 0) continue
+      const chainKey = key.slice(0, colon) as ChainKey
+      const address = key.slice(colon + 1)
+      if (chain !== 'all' && chain !== chainKey) continue
+      const label =
+        watchlist.find((w) => w.address.toLowerCase() === address)?.label ?? address
+      for (const stake of stakes) {
+        const endDay = stake.lockedDay + stake.stakedDays
+        rows.push({
+          key: `hist-${chainKey}-${address}-${stake.stakeId}`,
+          label,
+          address,
+          chain: chainKey,
+          currentDay: liveDay,
+          stake: { ...stake, status: 'ended', progressPct: 100 },
+          endDay,
+          daysLeft: null,
+        })
+      }
+    }
+    return rows
+  }, [historyByKey, chain, watchlist, liveDay])
+
   const addressOptions = useMemo(() => {
     const seen = new Map<
       string,
@@ -877,8 +943,19 @@ export function App() {
   }, [flatStakes, watchlist])
 
   const filteredStakes = useMemo(() => {
-    let rows =
-      filter === 'all' ? [...flatStakes] : flatStakes.filter((r) => r.stake.status === filter)
+    let rows: FlatStake[]
+    if (filter === 'ended') {
+      const liveEnded = flatStakes.filter((r) => r.stake.status === 'ended' && !r.stake.historical)
+      const histIds = new Set(historicalFlat.map((r) => `${r.chain}:${r.stake.stakeId}`))
+      const liveOnly = liveEnded.filter(
+        (r) => !histIds.has(`${r.chain}:${r.stake.stakeId}`),
+      )
+      rows = [...historicalFlat, ...liveOnly]
+    } else if (filter === 'all') {
+      rows = [...flatStakes]
+    } else {
+      rows = flatStakes.filter((r) => r.stake.status === filter)
+    }
     if (addrFilter !== 'all') {
       rows = rows.filter((r) => r.address.toLowerCase() === addrFilter)
     }
@@ -910,10 +987,13 @@ export function App() {
       if (a.stake.status === 'late') {
         return (b.daysLeft ?? 0) - (a.daysLeft ?? 0)
       }
+      if (a.stake.status === 'ended') {
+        return (b.stake.unlockedDay ?? 0) - (a.stake.unlockedDay ?? 0)
+      }
       return (a.daysLeft ?? 99999) - (b.daysLeft ?? 99999)
     })
     return rows
-  }, [flatStakes, filter, addrFilter, monthFilter, sortBy])
+  }, [flatStakes, historicalFlat, filter, addrFilter, monthFilter, sortBy])
 
   const stats = useMemo(() => {
     const liquid = scopedSnapshots.reduce((sum, s) => sum + Number(s.liquidHex || 0), 0)
@@ -1028,6 +1108,69 @@ export function App() {
 
   function setStakeCost(chainKey: ChainKey, stakeId: number, usd: number | null) {
     setCostBasis((prev) => setCostBasisEntry(prev, chainKey, stakeId, usd))
+  }
+
+  async function loadStakeHistory(force = false) {
+    if (historyLoadingRef.current) return
+    if (watchlist.length === 0) {
+      setHistoryByKey({})
+      setHistoryReady(true)
+      return
+    }
+    historyLoadingRef.current = true
+    setHistoryLoading(true)
+    setHistoryError(null)
+    setHistoryProgress('Reading quotes…')
+    try {
+      const quotes = await loadQuotesBoth()
+      const addrs = watchlist.map((w) => w.address)
+      const chains: ChainKey[] =
+        chain === 'all' ? [...BOTH_CHAINS] : [chain]
+      const result = await loadEndedHistoryForWatchlist(
+        addrs,
+        {
+          ethereum: quotes.ethereum.hexUsd,
+          pulsechain: quotes.pulsechain.hexUsd,
+        },
+        {
+          force,
+          chains,
+          onProgress: (p: HistoryProgress) => setHistoryProgress(p.label),
+          onPartial: (key, stakes) => {
+            setHistoryByKey((prev) => ({ ...prev, [key]: stakes }))
+            setHistoryReady(true)
+          },
+        },
+      )
+      setHistoryByKey((prev) => {
+        const next = { ...prev }
+        for (const [k, stakes] of Object.entries(result.byKey)) {
+          next[k] = stakes
+        }
+        // Drop keys for chains/addresses no longer in scope when force-refreshing scoped chain
+        if (force && chain !== 'all') {
+          for (const k of Object.keys(next)) {
+            if (!k.startsWith(`${chain}:`)) continue
+            if (!result.byKey[k]) delete next[k]
+          }
+        }
+        return next
+      })
+      if (result.errors.length) {
+        setHistoryError(
+          `Partial history · ${result.errors.slice(0, 2).join(' · ')}`,
+        )
+      } else if (result.partial) {
+        setHistoryError('Partial history · some RPC ranges failed')
+      }
+      setHistoryReady(true)
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : 'History scan failed.')
+    } finally {
+      setHistoryProgress(null)
+      setHistoryLoading(false)
+      historyLoadingRef.current = false
+    }
   }
 
   function openMaturityMonth(key: string) {
@@ -1748,11 +1891,45 @@ export function App() {
               </div>
             ) : null}
 
+            {filter === 'ended' ? (
+              <div className="history-bar" role="status">
+                <p>
+                  {historyLoading
+                    ? historyProgress ?? 'Scanning StakeEnd logs…'
+                    : historyReady
+                      ? `${filteredStakes.length} ended stake${
+                          filteredStakes.length === 1 ? '' : 's'
+                        } (from logs + live)`
+                      : 'Ended stakes come from on-chain logs (not live stakeLists).'}
+                </p>
+                <div className="history-bar-actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={historyLoading || watchlist.length === 0}
+                    onClick={() => void loadStakeHistory(true)}
+                  >
+                    {historyReady ? 'Refresh history' : 'Load history'}
+                  </button>
+                </div>
+              </div>
+            ) : null}
+
+            {historyError && filter === 'ended' ? (
+              <p className="banner error" role="alert">
+                {historyError}
+              </p>
+            ) : null}
+
             {filteredStakes.length === 0 ? (
               <p className="empty-inline">
-                {flatStakes.length === 0
-                  ? `No stakes on ${chainMeta.label}.`
-                  : 'No stakes match these filters.'}
+                {historyLoading
+                  ? 'Scanning history…'
+                  : filter === 'ended' && !historyReady
+                    ? 'Load history to scan StakeEnd logs for watched addresses.'
+                    : flatStakes.length === 0
+                      ? `No stakes on ${chainMeta.label}.`
+                      : 'No stakes match these filters.'}
               </p>
             ) : (
               <div className="stake-stack">

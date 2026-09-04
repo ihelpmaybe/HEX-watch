@@ -24,10 +24,14 @@ const TIMESTAMP_MASK = (1n << TIMESTAMP_BITS) - 1n
 const HEARTS_MASK = (1n << HEARTS_BITS) - 1n
 const DAY_MASK = (1n << DAY_BITS) - 1n
 
-/** Public RPCs often reject oversized eth_getLogs ranges. */
-const LOG_CHUNK = 4_000n
-/** v2 = StakeEnd-only scans (no StakeStart walk). */
-const CACHE_PREFIX = 'hex-watch/stake-history/v2/'
+/** Start chunk; shrinks on RPC range errors (some free RPCs cap at ~50–2k). */
+const LOG_CHUNK_START: Record<ChainKey, bigint> = {
+  ethereum: 2_000n,
+  pulsechain: 4_000n,
+}
+const LOG_CHUNK_MIN = 50n
+/** v3 = StakeEnd-only, newest-first, no empty-fail cache. */
+const CACHE_PREFIX = 'hex-watch/stake-history/v3/'
 
 const pulsechain = {
   id: 369,
@@ -43,6 +47,7 @@ export interface HistoryProgress {
   toBlock: bigint
   head: bigint
   label: string
+  found?: number
 }
 
 export interface HistoryLoadResult {
@@ -141,9 +146,10 @@ function decodeStakeEnd(data0: bigint, data1: bigint, stakeId: bigint): DecodedE
   }
 }
 
-async function clientFor(chain: ChainKey): Promise<PublicClient | null> {
+async function clientsFor(chain: ChainKey): Promise<PublicClient[]> {
   const config = CHAINS[chain]
   const viemChain = chain === 'ethereum' ? mainnet : pulsechain
+  const out: PublicClient[] = []
   for (const url of config.rpcUrls) {
     try {
       const client = createPublicClient({
@@ -152,12 +158,12 @@ async function clientFor(chain: ChainKey): Promise<PublicClient | null> {
       })
       const id = await client.getChainId()
       if (id !== config.chainId) continue
-      return client as PublicClient
+      out.push(client as PublicClient)
     } catch {
       /* next */
     }
   }
-  return null
+  return out
 }
 
 type HexStakeLog = {
@@ -168,72 +174,84 @@ type HexStakeLog = {
   }
 }
 
-async function getLogsChunked(
-  client: PublicClient,
+function isRangeError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error)
+  return /block|range|limited|exceed|10,?000|query returned more|response size/i.test(msg)
+}
+
+async function fetchStakeEndChunk(
+  clients: PublicClient[],
   stakerAddr: Address,
   fromBlock: bigint,
   toBlock: bigint,
-  onChunk?: (from: bigint, to: bigint) => void,
-): Promise<{ logs: HexStakeLog[]; partial: boolean; errors: string[] }> {
-  const eventName = 'StakeEnd' as const
-  const logs: HexStakeLog[] = []
-  const errors: string[] = []
-  let partial = false
-  let cursor = fromBlock
-
-  while (cursor <= toBlock) {
-    let end = cursor + LOG_CHUNK - 1n
-    if (end > toBlock) end = toBlock
-    onChunk?.(cursor, end)
+): Promise<{ logs: HexStakeLog[]; error?: string }> {
+  let lastErr = ''
+  for (const client of clients) {
     try {
       const batch = (await client.getContractEvents({
         address: HEX_ADDRESS,
         abi: HEX_EVENT_ABI,
-        eventName,
+        eventName: 'StakeEnd',
         args: { stakerAddr },
-        fromBlock: cursor,
-        toBlock: end,
+        fromBlock,
+        toBlock,
         strict: true,
       })) as HexStakeLog[]
-      logs.push(...batch)
+      return { logs: batch }
     } catch (error) {
-      partial = true
-      errors.push(
-        `${eventName} ${cursor}-${end}: ${
-          error instanceof Error ? error.message.split('\n')[0] : String(error)
-        }`,
-      )
-      // Shrink once and retry this window; if still failing, skip ahead.
-      const mid = cursor + (end - cursor) / 2n
-      if (mid > cursor && mid < end) {
-        try {
-          const a = (await client.getContractEvents({
-            address: HEX_ADDRESS,
-            abi: HEX_EVENT_ABI,
-            eventName,
-            args: { stakerAddr },
-            fromBlock: cursor,
-            toBlock: mid,
-            strict: true,
-          })) as HexStakeLog[]
-          const b = (await client.getContractEvents({
-            address: HEX_ADDRESS,
-            abi: HEX_EVENT_ABI,
-            eventName,
-            args: { stakerAddr },
-            fromBlock: mid + 1n,
-            toBlock: end,
-            strict: true,
-          })) as HexStakeLog[]
-          logs.push(...a, ...b)
-          partial = false
-          errors.pop()
-        } catch {
-          /* keep skip */
-        }
-      }
+      lastErr = error instanceof Error ? error.message.split('\n')[0] : String(error)
+      if (!isRangeError(error)) continue
+      // try next client with same range; caller may shrink
     }
-    cursor = end + 1n
+  }
+  return { logs: [], error: lastErr || 'getLogs failed' }
+}
+
+/**
+ * Newest → oldest StakeEnd scan so recent ends appear first.
+ * Shrinks chunk size when RPCs reject the range.
+ */
+async function getLogsNewestFirst(
+  clients: PublicClient[],
+  chain: ChainKey,
+  stakerAddr: Address,
+  fromBlock: bigint,
+  toBlock: bigint,
+  onChunk?: (from: bigint, to: bigint, found: number) => void,
+  onLogs?: (logs: HexStakeLog[]) => void,
+): Promise<{ logs: HexStakeLog[]; partial: boolean; errors: string[] }> {
+  const logs: HexStakeLog[] = []
+  const errors: string[] = []
+  let partial = false
+  let chunk = LOG_CHUNK_START[chain]
+  let cursor = toBlock
+
+  while (cursor >= fromBlock) {
+    let start = cursor - chunk + 1n
+    if (start < fromBlock) start = fromBlock
+    onChunk?.(start, cursor, logs.length)
+
+    let result = await fetchStakeEndChunk(clients, stakerAddr, start, cursor)
+    while (result.error && isRangeError(result.error) && chunk > LOG_CHUNK_MIN) {
+      chunk = chunk > 500n ? chunk / 2n : LOG_CHUNK_MIN
+      start = cursor - chunk + 1n
+      if (start < fromBlock) start = fromBlock
+      onChunk?.(start, cursor, logs.length)
+      result = await fetchStakeEndChunk(clients, stakerAddr, start, cursor)
+    }
+
+    if (result.error) {
+      partial = true
+      if (errors.length < 4) {
+        errors.push(`StakeEnd ${start}-${cursor}: ${result.error}`)
+      }
+    } else if (result.logs.length) {
+      logs.push(...result.logs)
+      onLogs?.(result.logs)
+    }
+
+    if (start === fromBlock) break
+    cursor = start - 1n
   }
 
   return { logs, partial, errors }
@@ -289,7 +307,6 @@ function blankEnrichment(note: string): Pick<
 function toStakeRow(end: DecodedEnd, hexUsd: number | null): StakeRow {
   const hearts = end.stakedHearts
   const shares = end.stakeShares
-  // StakeEnd carries servedDays, not original stakedDays — good enough for history cards.
   const stakedDays = end.servedDays
   const unlockedDay = estimateHexDay(end.timestamp * 1000)
   const lockedDay = Math.max(0, unlockedDay - stakedDays)
@@ -327,15 +344,29 @@ function toStakeRow(end: DecodedEnd, hexUsd: number | null): StakeRow {
   }
 }
 
-/** Scan StakeEnd logs only for one address on one chain. */
+function logsToRows(logs: HexStakeLog[], hexUsd: number | null, seen: Set<number>): StakeRow[] {
+  const stakes: StakeRow[] = []
+  for (const log of logs) {
+    const args = log.args
+    if (args.data0 == null || args.data1 == null || args.stakeId == null) continue
+    const end = decodeStakeEnd(args.data0, args.data1, BigInt(args.stakeId))
+    if (seen.has(end.stakeId)) continue
+    seen.add(end.stakeId)
+    stakes.push(toStakeRow(end, hexUsd))
+  }
+  return stakes
+}
+
+/** Scan StakeEnd logs only for one address on one chain (newest first). */
 export async function loadEndedHistory(
   chain: ChainKey,
   address: Address,
   hexUsd: number | null,
   onProgress?: (p: HistoryProgress) => void,
+  onPartial?: (stakes: StakeRow[]) => void,
 ): Promise<HistoryLoadResult> {
-  const client = await clientFor(chain)
-  if (!client) {
+  const clients = await clientsFor(chain)
+  if (clients.length === 0) {
     return {
       stakes: [],
       partial: true,
@@ -344,36 +375,48 @@ export async function loadEndedHistory(
     }
   }
 
-  const head = await client.getBlockNumber()
+  const head = await clients[0].getBlockNumber()
   const fromBlock = HEX_LOG_FROM_BLOCK[chain]
   const label = CHAINS[chain].label
-
-  const report = (from: bigint, to: bigint) =>
-    onProgress?.({
-      chain,
-      address,
-      fromBlock: from,
-      toBlock: to,
-      head,
-      label: `${label} StakeEnd ${from.toString()}–${to.toString()}`,
-    })
-
-  const ends = await getLogsChunked(client, address, fromBlock, head, report)
-
-  const stakes: StakeRow[] = []
   const seen = new Set<number>()
-  for (const log of ends.logs) {
-    const args = log.args
-    if (args.data0 == null || args.data1 == null || args.stakeId == null) continue
-    const end = decodeStakeEnd(args.data0, args.data1, BigInt(args.stakeId))
-    if (seen.has(end.stakeId)) continue
-    seen.add(end.stakeId)
-    stakes.push(toStakeRow(end, hexUsd))
+  const stakes: StakeRow[] = []
+
+  const ends = await getLogsNewestFirst(
+    clients,
+    chain,
+    address,
+    fromBlock,
+    head,
+    (from, to, found) =>
+      onProgress?.({
+        chain,
+        address,
+        fromBlock: from,
+        toBlock: to,
+        head,
+        found,
+        label: `${label} StakeEnd · ${found} found · blocks ${from.toString()}–${to.toString()}`,
+      }),
+    (batch) => {
+      const rows = logsToRows(batch, hexUsd, seen)
+      if (!rows.length) return
+      stakes.push(...rows)
+      stakes.sort((a, b) => b.unlockedDay - a.unlockedDay || b.stakeId - a.stakeId)
+      onPartial?.(stakes.slice())
+    },
+  )
+
+  // Dedup if onLogs path missed (errors-only path still has ends.logs)
+  if (stakes.length === 0 && ends.logs.length) {
+    stakes.push(...logsToRows(ends.logs, hexUsd, seen))
+    stakes.sort((a, b) => b.unlockedDay - a.unlockedDay || b.stakeId - a.stakeId)
   }
 
-  stakes.sort((a, b) => b.unlockedDay - a.unlockedDay || b.stakeId - a.stakeId)
-
-  const savedAt = saveHistoryCache(chain, address, stakes, ends.partial)
+  // Never cache a total miss caused by RPC failure — that blocks retries.
+  let savedAt = new Date().toISOString()
+  if (!(ends.partial && stakes.length === 0)) {
+    savedAt = saveHistoryCache(chain, address, stakes, ends.partial)
+  }
 
   return { stakes, partial: ends.partial, errors: ends.errors.slice(0, 4), savedAt }
 }
@@ -386,6 +429,7 @@ export async function loadEndedHistoryForWatchlist(
     force?: boolean
     chains?: ChainKey[]
     onProgress?: (p: HistoryProgress) => void
+    onPartial?: (key: string, stakes: StakeRow[]) => void
   } = {},
 ): Promise<{
   byKey: Record<string, StakeRow[]>
@@ -408,7 +452,16 @@ export async function loadEndedHistoryForWatchlist(
           continue
         }
       }
-      const result = await loadEndedHistory(chain, address, hexUsdByChain[chain], opts.onProgress)
+      const result = await loadEndedHistory(
+        chain,
+        address,
+        hexUsdByChain[chain],
+        opts.onProgress,
+        (stakes) => {
+          byKey[key] = stakes
+          opts.onPartial?.(key, stakes)
+        },
+      )
       byKey[key] = result.stakes
       if (result.partial) partial = true
       errors.push(...result.errors.map((e) => `${CHAINS[chain].label} ${address.slice(0, 6)}…: ${e}`))

@@ -338,10 +338,11 @@ export const CHAINS: Record<ChainKey, ChainConfig> = {
     chainId: 1,
     explorerStake: (address) => `https://etherscan.io/address/${address}`,
     rpcUrls: [
-      'https://ethereum-rpc.publicnode.com',
-      'https://ethereum.publicnode.com',
+      // Prefer RPCs that allow historical eth_getLogs (PublicNode needs archive token).
       'https://rpc.mevblocker.io',
       'https://eth.drpc.org',
+      'https://ethereum-rpc.publicnode.com',
+      'https://ethereum.publicnode.com',
     ],
   },
   pulsechain: {
